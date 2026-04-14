@@ -239,6 +239,115 @@ int external_command(char *args_cleaned[], char *in, char *out, int interactive)
     return 0;
 }
 
+void execute_pipeline(char *tokens[], int num_tokens, int interactive) {
+    int cmd_starts[MAX_TOKENS];
+    int cmd_lengths[MAX_TOKENS];
+    int num_cmds = 0;
+    int start = 0;
+
+    // split tokens on '|'
+    for (int i = 0; i <= num_tokens; i++) {
+        if (i == num_tokens || strcmp(tokens[i], "|") == 0) {
+            cmd_starts[num_cmds] = start;
+            cmd_lengths[num_cmds] = i - start;
+            num_cmds++;
+            start = i + 1;
+        }
+    }
+
+    // check for exit in pipeline per spec ("foo | exit" should terminate)
+    for (int i = 0; i < num_cmds; i++) {
+        int s = cmd_starts[i];
+        if (cmd_lengths[i] > 0 && strcmp(tokens[s], "exit") == 0) {
+            if (interactive)
+                write(STDOUT_FILENO, "Exiting my shell.\n", 18);
+            exit(EXIT_SUCCESS);
+        }
+    }
+
+    // validate — no empty subcommands (e.g. "ls |" or "| grep foo")
+    for (int i = 0; i < num_cmds; i++) {
+        if (cmd_lengths[i] == 0) {
+            write(STDERR_FILENO, "Syntax error\n", 13);
+            return;
+        }
+    }
+
+    // create all pipes upfront
+    int pipes[MAX_TOKENS][2];
+    for (int i = 0; i < num_cmds - 1; i++) {
+        if (pipe(pipes[i]) < 0) {
+            perror("pipe");
+            return;
+        }
+    }
+
+    pid_t pids[MAX_TOKENS];
+
+    for (int i = 0; i < num_cmds; i++) {
+        char *args[MAX_TOKENS];
+        int len = cmd_lengths[i];
+        int s = cmd_starts[i];
+
+        for (int j = 0; j < len; j++)
+            args[j] = tokens[s + j];
+        args[len] = NULL;
+
+        // resolve path
+        char path[BUF_SIZE];
+        if (!resolve_command_path(args[0], path)) {
+            write(STDERR_FILENO, "Command not found\n", 18);
+            // close all pipes before returning
+            for (int j = 0; j < num_cmds - 1; j++) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            return;
+        }
+
+        pids[i] = fork();
+        if (pids[i] < 0) {
+            perror("fork");
+            return;
+        }
+
+        if (pids[i] == 0) {
+            // if not first: read from previous pipe
+            if (i > 0)
+                dup2(pipes[i-1][0], STDIN_FILENO);
+
+            // if not last: write to next pipe
+            if (i < num_cmds - 1)
+                dup2(pipes[i][1], STDOUT_FILENO);
+
+            // child closes all pipe fds after dup2
+            for (int j = 0; j < num_cmds - 1; j++) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+
+            execv(path, args);
+            perror("execv");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    // parent MUST close all pipe ends
+    // otherwise last process hangs waiting for EOF that never comes
+    for (int i = 0; i < num_cmds - 1; i++) {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+
+    // wait for all children
+    int status = 0;
+    for (int i = 0; i < num_cmds; i++)
+        waitpid(pids[i], &status, 0);
+
+    // spec says: pipeline succeeds if and only if LAST command succeeds
+    report_child_status(status, interactive);
+}
+
 // main execution function
 int execute_command(char *buf, int interactive)
 {
@@ -256,6 +365,21 @@ int execute_command(char *buf, int interactive)
     if (num_tokens == 0)
         return 0;
 
+    int has_pipe = 0;
+    for (int i = 0; i < num_tokens; i++) {
+        if (strcmp(tokens[i], "|") == 0) {
+            has_pipe = 1;
+            break;
+        }
+    }
+
+    // hand off to pipeline executor
+    if (has_pipe) {
+        execute_pipeline(tokens, num_tokens, interactive);
+        return 0;
+    }
+
+	
     char *args_cleaned[MAX_TOKENS];
     char *in = NULL;
     char *out = NULL;
