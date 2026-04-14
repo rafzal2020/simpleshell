@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <dirent.h>
 
 #define BUF_SIZE 1024
 #define MAX_TOKENS 64
@@ -100,6 +101,175 @@ int parse_redirection(char *tokens[], int num_tokens,
         return -1;
 
     return num_args;
+}
+
+int matches_pattern(const char *name, const char *prefix, const char *suffix)
+{
+    size_t name_len = strlen(name);
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+
+    // filename must be long enough to contain both prefix and suffix
+    if (name_len < prefix_len + suffix_len)
+        return 0;
+
+    // must start with prefix
+    if (strncmp(name, prefix, prefix_len) != 0)
+        return 0;
+
+    // must end with suffix
+    if (strcmp(name + name_len - suffix_len, suffix) != 0)
+        return 0;
+
+    return 1;
+}
+
+int expand_wildcard_token(char *token, char *expanded_args[], int allocated_flags[], int num_expanded)
+{
+    char token_copy[BUF_SIZE];
+    char dir_path[BUF_SIZE];
+    char pattern[BUF_SIZE];
+    char prefix[BUF_SIZE];
+    char suffix[BUF_SIZE];
+    char *slash;
+    char *star;
+    DIR *dir;
+    struct dirent *entry;
+    int found_match = 0;
+
+    strncpy(token_copy, token, BUF_SIZE - 1);
+    token_copy[BUF_SIZE - 1] = '\0';
+
+    // split into directory path and last filename section
+    slash = strrchr(token_copy, '/');
+    if (slash != NULL)
+    {
+        *slash = '\0';
+        strncpy(dir_path, token_copy, BUF_SIZE - 1);
+        dir_path[BUF_SIZE - 1] = '\0';
+
+        strncpy(pattern, slash + 1, BUF_SIZE - 1);
+        pattern[BUF_SIZE - 1] = '\0';
+    }
+    else
+    {
+        strcpy(dir_path, ".");
+        strncpy(pattern, token_copy, BUF_SIZE - 1);
+        pattern[BUF_SIZE - 1] = '\0';
+    }
+
+    // find the single '*'
+    star = strchr(pattern, '*');
+    if (star == NULL)
+    {
+        expanded_args[num_expanded++] = token;
+        return num_expanded;
+    }
+
+    // split pattern into prefix and suffix
+    *star = '\0';
+    strncpy(prefix, pattern, BUF_SIZE - 1);
+    prefix[BUF_SIZE - 1] = '\0';
+
+    strncpy(suffix, star + 1, BUF_SIZE - 1);
+    suffix[BUF_SIZE - 1] = '\0';
+
+    dir = opendir(dir_path);
+    if (dir == NULL)
+    {
+        // if directory can't be opened, keep token unchanged
+        expanded_args[num_expanded] = token;
+        allocated_flags[num_expanded] = 0;
+        return num_expanded + 1;
+    }
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        char *name = entry->d_name;
+
+        // hidden file rule:
+        // patterns like *.txt (empty prefix) do not match names starting with '.'
+        if (prefix[0] == '\0' && name[0] == '.')
+            continue;
+
+        if (matches_pattern(name, prefix, suffix))
+        {
+            found_match = 1;
+
+            if (strcmp(dir_path, ".") == 0)
+            {
+                // no directory prefix in original token
+                expanded_args[num_expanded] = malloc(strlen(name) + 1);
+                if (expanded_args[num_expanded] == NULL)
+                {
+                    closedir(dir);
+                    return num_expanded;
+                }
+                strcpy(expanded_args[num_expanded], name);
+            }
+            else
+            {
+                // preserve directory prefix in expanded result
+                size_t len = strlen(dir_path) + 1 + strlen(name) + 1;
+                expanded_args[num_expanded] = malloc(len);
+                if (expanded_args[num_expanded] == NULL)
+                {
+                    closedir(dir);
+                    return num_expanded;
+                }
+                snprintf(expanded_args[num_expanded], len, "%s/%s", dir_path, name);
+            }
+
+            allocated_flags[num_expanded] = 1;
+            num_expanded++;
+        }
+    }
+
+    closedir(dir);
+
+    // if nothing matched, keep original token unchanged
+    if (!found_match)
+    {
+        expanded_args[num_expanded] = token;
+        allocated_flags[num_expanded] = 0;
+        num_expanded++;
+    }
+
+    return num_expanded;
+}
+
+int expand_wildcards(char *args_cleaned[], int num_args, char *expanded_args[], int allocated_flags[])
+{
+    int num_expanded = 0;
+
+    for (int i = 0; i < num_args; i++)
+    {
+        if (strchr(args_cleaned[i], '*') != NULL)
+        {
+            num_expanded = expand_wildcard_token(args_cleaned[i],
+                                                 expanded_args,
+                                                 allocated_flags,
+                                                 num_expanded);
+        }
+        else
+        {
+            expanded_args[num_expanded] = args_cleaned[i];
+            allocated_flags[num_expanded] = 0;
+            num_expanded++;
+        }
+    }
+
+    expanded_args[num_expanded] = NULL;
+    return num_expanded;
+}
+
+void free_expanded_args(char *expanded_args[], int allocated_flags[], int num_expanded)
+{
+    for (int i = 0; i < num_expanded; i++)
+    {
+        if (allocated_flags[i])
+            free(expanded_args[i]);
+    }
 }
 
 // find executable path
@@ -236,18 +406,21 @@ int external_command(char *args_cleaned[], char *in, char *out, int interactive)
         report_child_status(status, interactive);
     }
 
-    return 0;
+        return 0;
 }
 
-void execute_pipeline(char *tokens[], int num_tokens, int interactive) {
+void execute_pipeline(char *tokens[], int num_tokens, int interactive)
+{
     int cmd_starts[MAX_TOKENS];
     int cmd_lengths[MAX_TOKENS];
     int num_cmds = 0;
     int start = 0;
 
     // split tokens on '|'
-    for (int i = 0; i <= num_tokens; i++) {
-        if (i == num_tokens || strcmp(tokens[i], "|") == 0) {
+    for (int i = 0; i <= num_tokens; i++)
+    {
+        if (i == num_tokens || strcmp(tokens[i], "|") == 0)
+        {
             cmd_starts[num_cmds] = start;
             cmd_lengths[num_cmds] = i - start;
             num_cmds++;
@@ -256,9 +429,11 @@ void execute_pipeline(char *tokens[], int num_tokens, int interactive) {
     }
 
     // check for exit in pipeline per spec ("foo | exit" should terminate)
-    for (int i = 0; i < num_cmds; i++) {
+    for (int i = 0; i < num_cmds; i++)
+    {
         int s = cmd_starts[i];
-        if (cmd_lengths[i] > 0 && strcmp(tokens[s], "exit") == 0) {
+        if (cmd_lengths[i] > 0 && strcmp(tokens[s], "exit") == 0)
+        {
             if (interactive)
                 write(STDOUT_FILENO, "Exiting my shell.\n", 18);
             exit(EXIT_SUCCESS);
@@ -266,8 +441,10 @@ void execute_pipeline(char *tokens[], int num_tokens, int interactive) {
     }
 
     // validate — no empty subcommands (e.g. "ls |" or "| grep foo")
-    for (int i = 0; i < num_cmds; i++) {
-        if (cmd_lengths[i] == 0) {
+    for (int i = 0; i < num_cmds; i++)
+    {
+        if (cmd_lengths[i] == 0)
+        {
             write(STDERR_FILENO, "Syntax error\n", 13);
             return;
         }
@@ -275,8 +452,10 @@ void execute_pipeline(char *tokens[], int num_tokens, int interactive) {
 
     // create all pipes upfront
     int pipes[MAX_TOKENS][2];
-    for (int i = 0; i < num_cmds - 1; i++) {
-        if (pipe(pipes[i]) < 0) {
+    for (int i = 0; i < num_cmds - 1; i++)
+    {
+        if (pipe(pipes[i]) < 0)
+        {
             perror("pipe");
             return;
         }
@@ -284,7 +463,8 @@ void execute_pipeline(char *tokens[], int num_tokens, int interactive) {
 
     pid_t pids[MAX_TOKENS];
 
-    for (int i = 0; i < num_cmds; i++) {
+    for (int i = 0; i < num_cmds; i++)
+    {
         char *args[MAX_TOKENS];
         int len = cmd_lengths[i];
         int s = cmd_starts[i];
@@ -295,10 +475,12 @@ void execute_pipeline(char *tokens[], int num_tokens, int interactive) {
 
         // resolve path
         char path[BUF_SIZE];
-        if (!resolve_command_path(args[0], path)) {
+        if (!resolve_command_path(args[0], path))
+        {
             write(STDERR_FILENO, "Command not found\n", 18);
             // close all pipes before returning
-            for (int j = 0; j < num_cmds - 1; j++) {
+            for (int j = 0; j < num_cmds - 1; j++)
+            {
                 close(pipes[j][0]);
                 close(pipes[j][1]);
             }
@@ -306,22 +488,25 @@ void execute_pipeline(char *tokens[], int num_tokens, int interactive) {
         }
 
         pids[i] = fork();
-        if (pids[i] < 0) {
+        if (pids[i] < 0)
+        {
             perror("fork");
             return;
         }
 
-        if (pids[i] == 0) {
+        if (pids[i] == 0)
+        {
             // if not first: read from previous pipe
             if (i > 0)
-                dup2(pipes[i-1][0], STDIN_FILENO);
+                dup2(pipes[i - 1][0], STDIN_FILENO);
 
             // if not last: write to next pipe
             if (i < num_cmds - 1)
                 dup2(pipes[i][1], STDOUT_FILENO);
 
             // child closes all pipe fds after dup2
-            for (int j = 0; j < num_cmds - 1; j++) {
+            for (int j = 0; j < num_cmds - 1; j++)
+            {
                 close(pipes[j][0]);
                 close(pipes[j][1]);
             }
@@ -334,7 +519,8 @@ void execute_pipeline(char *tokens[], int num_tokens, int interactive) {
 
     // parent MUST close all pipe ends
     // otherwise last process hangs waiting for EOF that never comes
-    for (int i = 0; i < num_cmds - 1; i++) {
+    for (int i = 0; i < num_cmds - 1; i++)
+    {
         close(pipes[i][0]);
         close(pipes[i][1]);
     }
@@ -351,7 +537,6 @@ void execute_pipeline(char *tokens[], int num_tokens, int interactive) {
 // main execution function
 int execute_command(char *buf, int interactive)
 {
-    (void)interactive;
 
     // run through parsing helper functions
     strip_comment(buf);
@@ -366,20 +551,22 @@ int execute_command(char *buf, int interactive)
         return 0;
 
     int has_pipe = 0;
-    for (int i = 0; i < num_tokens; i++) {
-        if (strcmp(tokens[i], "|") == 0) {
+    for (int i = 0; i < num_tokens; i++)
+    {
+        if (strcmp(tokens[i], "|") == 0)
+        {
             has_pipe = 1;
             break;
         }
     }
 
     // hand off to pipeline executor
-    if (has_pipe) {
+    if (has_pipe)
+    {
         execute_pipeline(tokens, num_tokens, interactive);
         return 0;
     }
 
-	
     char *args_cleaned[MAX_TOKENS];
     char *in = NULL;
     char *out = NULL;
@@ -392,33 +579,40 @@ int execute_command(char *buf, int interactive)
         return 0;
     }
 
+    char *expanded_args[MAX_TOKENS];
+    int allocated_flags[MAX_TOKENS];
+    int num_expanded = expand_wildcards(args_cleaned, num_args, expanded_args, allocated_flags);
+
     // built-in: exit
-    if (strcmp(args_cleaned[0], "exit") == 0)
+    if (strcmp(expanded_args[0], "exit") == 0)
     {
+        free_expanded_args(expanded_args, allocated_flags, num_expanded);
         return 1;
     }
 
     // built-in: cd
-    else if (strcmp(args_cleaned[0], "cd") == 0)
+    else if (strcmp(expanded_args[0], "cd") == 0)
     {
         char *dir;
 
         // cd with no args goes to HOME
-        if (num_args == 1)
+        if (num_expanded == 1)
             dir = getenv("HOME");
 
         // otherwise transfer to given directory
-        else if (num_args == 2)
-            dir = args_cleaned[1];
+        else if (num_expanded == 2)
+            dir = expanded_args[1];
         else
         {
             write(STDOUT_FILENO, "cd: too many arguments\n", 23);
+            free_expanded_args(expanded_args, allocated_flags, num_expanded);
             return 0;
         }
 
         if (dir == NULL)
         {
             write(STDERR_FILENO, "cd: HOME not set\n", 17);
+            free_expanded_args(expanded_args, allocated_flags, num_expanded);
             return 0;
         }
 
@@ -426,12 +620,12 @@ int execute_command(char *buf, int interactive)
         {
             perror("cd");
         }
-
+        free_expanded_args(expanded_args, allocated_flags, num_expanded);
         return 0;
     }
 
     // built-in: pwd
-    else if (strcmp(args_cleaned[0], "pwd") == 0)
+    else if (strcmp(expanded_args[0], "pwd") == 0)
     {
         int saved_stdout = -1;
         int fd = -1;
@@ -444,6 +638,7 @@ int execute_command(char *buf, int interactive)
             if (fd < 0)
             {
                 perror(out);
+                free_expanded_args(expanded_args, allocated_flags, num_expanded);
                 return 0;
             }
 
@@ -453,6 +648,7 @@ int execute_command(char *buf, int interactive)
             {
                 perror("dup");
                 close(fd);
+                free_expanded_args(expanded_args, allocated_flags, num_expanded);
                 return 0;
             }
 
@@ -462,6 +658,7 @@ int execute_command(char *buf, int interactive)
                 perror("dup2");
                 close(fd);
                 close(saved_stdout);
+                free_expanded_args(expanded_args, allocated_flags, num_expanded);
                 return 0;
             }
 
@@ -486,12 +683,12 @@ int execute_command(char *buf, int interactive)
             dup2(saved_stdout, STDOUT_FILENO);
             close(saved_stdout);
         }
-
+        free_expanded_args(expanded_args, allocated_flags, num_expanded);
         return 0;
     }
 
     // built-in: which
-    else if (strcmp(args_cleaned[0], "which") == 0)
+    else if (strcmp(expanded_args[0], "which") == 0)
     {
         int saved_stdout = -1;
         int fd = -1;
@@ -505,6 +702,7 @@ int execute_command(char *buf, int interactive)
             if (fd < 0)
             {
                 perror(out);
+                free_expanded_args(expanded_args, allocated_flags, num_expanded);
                 return 0;
             }
 
@@ -513,6 +711,7 @@ int execute_command(char *buf, int interactive)
             {
                 perror("dup");
                 close(fd);
+                free_expanded_args(expanded_args, allocated_flags, num_expanded);
                 return 0;
             }
 
@@ -521,6 +720,7 @@ int execute_command(char *buf, int interactive)
                 perror("dup2");
                 close(fd);
                 close(saved_stdout);
+                free_expanded_args(expanded_args, allocated_flags, num_expanded);
                 return 0;
             }
 
@@ -528,30 +728,30 @@ int execute_command(char *buf, int interactive)
         }
 
         // which takes exactly 1 argument
-        if (num_args != 2)
+        if (num_expanded != 2)
         {
             // fail
         }
-        else if (strcmp(args_cleaned[1], "cd") == 0 ||
-                 strcmp(args_cleaned[1], "pwd") == 0 ||
-                 strcmp(args_cleaned[1], "which") == 0 ||
-                 strcmp(args_cleaned[1], "exit") == 0)
+        else if (strcmp(expanded_args[1], "cd") == 0 ||
+                 strcmp(expanded_args[1], "pwd") == 0 ||
+                 strcmp(expanded_args[1], "which") == 0 ||
+                 strcmp(expanded_args[1], "exit") == 0)
         {
             // built-ins do nothing with which
         }
 
         // treat argument as path with /
-        else if (strchr(args_cleaned[1], '/') != NULL)
+        else if (strchr(expanded_args[1], '/') != NULL)
         {
-            if (access(args_cleaned[1], X_OK) == 0)
+            if (access(expanded_args[1], X_OK) == 0)
             {
-                write(STDOUT_FILENO, args_cleaned[1], strlen(args_cleaned[1]));
+                write(STDOUT_FILENO, expanded_args[1], strlen(expanded_args[1]));
                 write(STDOUT_FILENO, "\n", 1);
             }
         }
 
         // otherwise search directories
-        else if (find_path(args_cleaned[1], path))
+        else if (find_path(expanded_args[1], path))
         {
             write(STDOUT_FILENO, path, strlen(path));
             write(STDOUT_FILENO, "\n", 1);
@@ -564,11 +764,15 @@ int execute_command(char *buf, int interactive)
             close(saved_stdout);
         }
 
+        free_expanded_args(expanded_args, allocated_flags, num_expanded);
+
         return 0;
     }
 
     // external command: fork + execv
-    return external_command(args_cleaned, in, out, interactive);
+    int result = external_command(expanded_args, in, out, interactive);
+    free_expanded_args(expanded_args, allocated_flags, num_expanded);
+    return result;
 }
 
 void input_loop(int input_fd, int interactive)
