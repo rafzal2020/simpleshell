@@ -103,13 +103,17 @@ int parse_redirection(char *tokens[], int num_tokens,
     return num_args;
 }
 
+// check if filename matches pattern: prefix*suffix
 int matches_pattern(const char *name, const char *prefix, const char *suffix)
 {
+    // length of filename, prefix before *, suffix after *
     size_t name_len = strlen(name);
     size_t prefix_len = strlen(prefix);
     size_t suffix_len = strlen(suffix);
 
-    // filename must be long enough to contain both prefix and suffix
+    // fprintf(stderr, "Checking name='%s' against prefix='%s' suffix='%s'\n", name, prefix, suffix);
+
+    // filename has to be long enough to contain prefix and suffix
     if (name_len < prefix_len + suffix_len)
         return 0;
 
@@ -121,26 +125,40 @@ int matches_pattern(const char *name, const char *prefix, const char *suffix)
     if (strcmp(name + name_len - suffix_len, suffix) != 0)
         return 0;
 
+    // fprintf(stderr, "Match found\n");
     return 1;
 }
 
+// expands single wildcard token with * into matching filenames
 int expand_wildcard_token(char *token, char *expanded_args[], int allocated_flags[], int num_expanded)
 {
+    // local writable copies for splitting token
     char token_copy[BUF_SIZE];
     char dir_path[BUF_SIZE];
     char pattern[BUF_SIZE];
     char prefix[BUF_SIZE];
     char suffix[BUF_SIZE];
+
+    // last / in token
     char *slash;
+
+    // * inside filename
     char *star;
+
     DIR *dir;
     struct dirent *entry;
+
+    // check if matching filename was found
     int found_match = 0;
 
+    // copy original token so it can be modified with \0
     strncpy(token_copy, token, BUF_SIZE - 1);
     token_copy[BUF_SIZE - 1] = '\0';
 
+    // fprintf(stderr, Expand token='%s'\n", token);
+
     // split into directory path and last filename section
+    // if there is no slash, search current directory
     slash = strrchr(token_copy, '/');
     if (slash != NULL)
     {
@@ -158,11 +176,13 @@ int expand_wildcard_token(char *token, char *expanded_args[], int allocated_flag
         pattern[BUF_SIZE - 1] = '\0';
     }
 
-    // find the single '*'
+    // find * in filename pattern if there is one
     star = strchr(pattern, '*');
     if (star == NULL)
     {
         expanded_args[num_expanded++] = token;
+
+        // fprintf(stderr, "No '*' found, keeping token unchanged\n");
         return num_expanded;
     }
 
@@ -174,6 +194,7 @@ int expand_wildcard_token(char *token, char *expanded_args[], int allocated_flag
     strncpy(suffix, star + 1, BUF_SIZE - 1);
     suffix[BUF_SIZE - 1] = '\0';
 
+    // open directory being scanned for matches
     dir = opendir(dir_path);
     if (dir == NULL)
     {
@@ -183,25 +204,30 @@ int expand_wildcard_token(char *token, char *expanded_args[], int allocated_flag
         return num_expanded + 1;
     }
 
+    // scan every entry in target directory
     while ((entry = readdir(dir)) != NULL)
     {
         char *name = entry->d_name;
 
         // hidden file rule:
-        // patterns like *.txt (empty prefix) do not match names starting with '.'
+        // patterns like *.txt do not match names starting with a period
         if (prefix[0] == '\0' && name[0] == '.')
             continue;
 
+        // check if the entry matches proper pattern
         if (matches_pattern(name, prefix, suffix))
         {
             found_match = 1;
+            // fprintf(stderr, "Matched name='%s'\n", name);
 
             if (strcmp(dir_path, ".") == 0)
             {
                 // no directory prefix in original token
+                // store filename
                 expanded_args[num_expanded] = malloc(strlen(name) + 1);
                 if (expanded_args[num_expanded] == NULL)
                 {
+                    // allocation failed, stop expansion
                     closedir(dir);
                     return num_expanded;
                 }
@@ -220,6 +246,7 @@ int expand_wildcard_token(char *token, char *expanded_args[], int allocated_flag
                 snprintf(expanded_args[num_expanded], len, "%s/%s", dir_path, name);
             }
 
+            // mark this entry as allocated in order to free it later
             allocated_flags[num_expanded] = 1;
             num_expanded++;
         }
@@ -235,17 +262,27 @@ int expand_wildcard_token(char *token, char *expanded_args[], int allocated_flag
         num_expanded++;
     }
 
+    // fprintf(stderr, "Expansion done, num_expanded=%d\n", num_expanded);
     return num_expanded;
 }
 
+// if argument contains *, call expand_wildcard_token
+// otherwise copy directly into the arg list
 int expand_wildcards(char *args_cleaned[], int num_args, char *expanded_args[], int allocated_flags[])
 {
+    // track number of arguments after expansion
     int num_expanded = 0;
 
+    // loop through each original argument
     for (int i = 0; i < num_args; i++)
     {
+        // check if argument contains *
         if (strchr(args_cleaned[i], '*') != NULL)
         {
+            // fprintf(stderr, "Expanding wildcard arg='%s'\n", args_cleaned[i]);
+
+            // expand wildcard token into different arguments
+            // appends directly to expanded_args and updates number
             num_expanded = expand_wildcard_token(args_cleaned[i],
                                                  expanded_args,
                                                  allocated_flags,
@@ -253,16 +290,26 @@ int expand_wildcards(char *args_cleaned[], int num_args, char *expanded_args[], 
         }
         else
         {
+            // if no *, copy pointer directly
             expanded_args[num_expanded] = args_cleaned[i];
+
+            // not allocated, doesn't need to be freed
             allocated_flags[num_expanded] = 0;
+
+            // fprintf(stderr, "Copying arg='%s'\n", args_cleaned[i]);
             num_expanded++;
         }
     }
 
+    // end array with \0
     expanded_args[num_expanded] = NULL;
+
+    // fprintf(stderr, "Total expanded args=%d\n", num_expanded);
     return num_expanded;
 }
 
+// free any entries marked as allocated
+// called after every return to prevent memory leaks
 void free_expanded_args(char *expanded_args[], int allocated_flags[], int num_expanded)
 {
     for (int i = 0; i < num_expanded; i++)
@@ -336,12 +383,16 @@ int apply_child_redirection(char *in, char *out)
 // report if child failed in interactive mode
 void report_child_status(int status, int interactive)
 {
+    // dont print status message in batch mode
     if (!interactive)
         return;
 
+    // check if child process exited normally
     if (WIFEXITED(status))
     {
         int exit_code = WEXITSTATUS(status);
+
+        // report error
         if (exit_code != 0)
         {
             char msg[BUF_SIZE];
@@ -350,9 +401,13 @@ void report_child_status(int status, int interactive)
             write(STDOUT_FILENO, msg, len);
         }
     }
+
+    // check if child was terminated by a signal
     else if (WIFSIGNALED(status))
     {
         char msg[BUF_SIZE];
+
+        // get signal number that caused termination
         int sig = WTERMSIG(status);
         int len = snprintf(msg, sizeof(msg),
                            "Terminated by signal %d\n", sig);
@@ -406,7 +461,7 @@ int external_command(char *args_cleaned[], char *in, char *out, int interactive)
         report_child_status(status, interactive);
     }
 
-        return 0;
+    return 0;
 }
 
 void execute_pipeline(char *tokens[], int num_tokens, int interactive)
@@ -538,18 +593,23 @@ void execute_pipeline(char *tokens[], int num_tokens, int interactive)
 int execute_command(char *buf, int interactive)
 {
 
-    // run through parsing helper functions
+    // strip comments after #
     strip_comment(buf);
 
+    // check if line is empty
     if (buf[0] == '\0')
         return 0;
 
+    // separate input into tokens
     char *tokens[MAX_TOKENS];
     int num_tokens = tokenize_input(buf, tokens);
 
     if (num_tokens == 0)
         return 0;
 
+    // fprintf(stderr, "Tokens parsed: %d\n", num_tokens);
+
+    // check if command contains pipe |
     int has_pipe = 0;
     for (int i = 0; i < num_tokens; i++)
     {
@@ -567,6 +627,7 @@ int execute_command(char *buf, int interactive)
         return 0;
     }
 
+    // remove redirection tokens and extract input/output files
     char *args_cleaned[MAX_TOKENS];
     char *in = NULL;
     char *out = NULL;
@@ -579,6 +640,7 @@ int execute_command(char *buf, int interactive)
         return 0;
     }
 
+    // expand wildcard tokens into actual filenames
     char *expanded_args[MAX_TOKENS];
     int allocated_flags[MAX_TOKENS];
     int num_expanded = expand_wildcards(args_cleaned, num_args, expanded_args, allocated_flags);
