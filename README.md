@@ -1,9 +1,9 @@
 # CS 214 — Project III: mysh
 ## README & Test Plan
 
-**Partner 1:** Name: Rayaan Afzal NetID: ra965
+Rayaan Afzal / ra965
 
-**Partner 2:** Name: Anthony Rahner  NetID: arr234
+Anthony Rahner / arr234
 
 ---
 
