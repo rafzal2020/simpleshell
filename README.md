@@ -383,11 +383,11 @@ The following `.sh` files are included as batch-mode test inputs. Run them with 
 | File | What it tests |
 |------|---------------|
 | `test_basic.sh` | Basic commands: echo, ls, pwd, cd |
-| `test_redirection.sh` | Input and output redirection scenarios |
-| `test_pipeline.sh` | Single and multi-stage pipelines |
-| `test_wildcards.sh` | Wildcard expansion cases |
-| `test_errors.sh` | Syntax errors, bad paths, bad redirections |
-| `test_builtins.sh` | All four built-in commands including edge cases |
+| `redirection.sh` | Input and output redirection scenarios |
+| `pipeline.sh` | Single and multi-stage pipelines |
+| `wildcards.sh` | Wildcard expansion cases |
+| `errors.sh` | Syntax errors, bad paths, bad redirections |
+| `builtins.sh` | All four built-in commands including edge cases |
 
 ---
 
